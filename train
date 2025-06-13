@@ -1,0 +1,287 @@
+import torch
+from torch.utils.data import Dataset, DataLoader, random_split
+from torchvision.datasets import ImageFolder
+from torchvision import transforms
+import pandas as pd
+import numpy as np
+import os
+
+# 1. 定义计算设备（GPU优先）
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"使用设备: {device}")
+
+# 2. 数据集路径（假设为Kaggle数据集路径）
+path = '/kaggle/input/leaves/classify-leaves'
+
+# 3. 读取数据集和标签
+data_images = ImageFolder(root=path)
+train_csv = pd.read_csv(os.path.join(path, 'train.csv'))
+
+# 4. 定义类别到数字的映射
+class_to_num = train_csv.label.unique()
+print(f"总类别数: {len(class_to_num)}")
+
+# 5. 将训练集标签映射为类别号
+train_csv['class_num'] = train_csv['label'].apply(lambda x: np.where(class_to_num == x)[0][0])
+
+# 6. 定义数据集类（继承自Dataset）
+class leaf_dataset(Dataset):
+    def __init__(self, imgs, labels, train=True, transform=None):
+        to_train = len(labels)
+        to_valid = len(imgs)
+
+        if len(imgs) > len(labels):
+            indices1 = range(to_train)
+            imgs_to_train = torch.utils.data.Subset(imgs, indices1)
+            indices2 = range(to_train, to_valid)
+            imgs_to_valid = torch.utils.data.Subset(imgs, indices2)
+            labels_valid = pd.Series([-1] * (len(imgs) - len(labels)))
+
+            if train:
+                self.imgs = imgs_to_train
+                self.labels = labels
+            else:
+                self.imgs = imgs_to_valid
+                self.labels = labels_valid
+        else:
+            self.imgs = imgs
+            self.labels = labels
+
+        if transform:
+            self.transform = transform
+        else:
+            self.transform = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor()
+            ])
+
+    def __len__(self):
+        return len(self.imgs)
+
+    def __getitem__(self, idx):
+        label = self.labels[idx]
+        data_in = self.imgs[idx][0]
+        data = self.transform(data_in)
+        return data, label
+
+# 7. 初始化数据集
+imgs = data_images
+labels = train_csv.class_num
+print(f"总图像数: {len(imgs)}, 训练标签数: {len(labels)}")
+
+# 8. 定义数据增强（训练集和测试集）
+normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+train_augs = transforms.Compose([
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.5),
+    normalize
+])
+test_augs = transforms.Compose([
+    normalize
+])
+
+# 9. 创建训练集和验证集
+Leaf_dataset_train = leaf_dataset(imgs=imgs, labels=labels, train=True)
+Leaf_dataset_valid = leaf_dataset(imgs=imgs, labels=labels, train=False)
+print(f"训练集大小: {len(Leaf_dataset_train)}, 验证集大小: {len(Leaf_dataset_valid)}")
+
+# 10. 拆分测试集（从训练集中拆分出1%作为测试集）
+def to_split(dataset, ratio=0.01):
+    num = len(dataset)
+    part1 = int(num * (1 - ratio))
+    part2 = num - part1
+    train_set, test_set = random_split(dataset, [part1, part2])
+    return train_set, test_set
+
+train_set, test_set = to_split(Leaf_dataset_train, ratio=0.01)
+print(f"本地训练集大小: {len(train_set)}, 本地测试集大小: {len(test_set)}")
+
+# 11. 加载预训练模型并调整输出层
+pretrained_net = torch.hub.load('pytorch/vision:v0.10.0', 'resnet34', pretrained=True)
+num_classes = len(class_to_num)
+pretrained_net.fc = torch.nn.Linear(512, num_classes)
+pretrained_net = pretrained_net.to(device)
+print("模型结构调整完成")
+
+# 12. 定义优化器
+lr = 0.0001
+optimizer = torch.optim.AdamW(pretrained_net.parameters(), lr=lr, weight_decay=0.001)
+print("优化器初始化完成")
+
+import time
+from torch import nn
+
+# 定义评估函数
+def evaluate_accuracy(data_iter, net, device=None):
+    if device is None and isinstance(net, torch.nn.Module):
+        device = list(net.parameters())[0].device
+    acc_sum, n = 0.0, 0
+    with torch.no_grad():
+        for X, y in data_iter:
+            X = test_augs(X)
+            if isinstance(net, torch.nn.Module):
+                net.eval()
+                acc_sum += (net(X.to(device)).argmax(dim=1) == y.to(device)).float().sum().cpu().item()
+                net.train()
+            else:
+                if 'is_training' in net.__code__.co_varnames:
+                    acc_sum += (net(X, is_training=False).argmax(dim=1) == y).float().sum().item()
+                else:
+                    acc_sum += (net(X).argmax(dim=1) == y).float().sum().item()
+            n += y.shape[0]
+    return acc_sum / n
+
+# 定义训练函数
+def train(train_iter, test_iter, net, loss, optimizer, device, num_epochs):
+    net = net.to(device)
+    print('training on ', device)
+    batch_count = 0
+    train_acc_history = []
+    test_acc_history = []
+    train_loss_history = []
+    
+    for epoch in range(num_epochs):
+        train_l_sum, train_acc_sum, n, start = 0.0, 0.0, 0, time.time()
+        for X, y in train_iter:
+            X = X.to(device)
+            X = train_augs(X)
+            y = y.to(device)
+            y_hat = net(X)
+            l = loss(y_hat, y)
+            optimizer.zero_grad()
+            l.backward()
+            optimizer.step()
+            train_l_sum += l.cpu().item()
+            train_acc_sum += (y_hat.argmax(dim=1) == y).sum().cpu().item()
+            n += y.shape[0]
+            batch_count += 1
+        
+        test_acc = evaluate_accuracy(test_iter, net)
+        train_acc = train_acc_sum / n
+        train_loss = train_l_sum / batch_count
+        
+        train_acc_history.append(train_acc)
+        test_acc_history.append(test_acc)
+        train_loss_history.append(train_loss)
+        
+        print(f'epoch {epoch+1}, loss {train_loss:.4f}, train acc {train_acc:.3f}, test acc {test_acc:.3f}, time {time.time() - start:.1f} sec')
+    
+    return net, train_acc_history, test_acc_history, train_loss_history
+
+# 定义微调训练函数
+def train_fine_tuning(net, optimizer, batch_size=128, num_epochs=20):
+    train_iter = DataLoader(train_set, batch_size)
+    test_iter = DataLoader(test_set, batch_size)
+    loss = nn.CrossEntropyLoss()
+    return train(train_iter, test_iter, net, loss, optimizer, device, num_epochs)
+
+# 执行训练
+print("开始训练模型...")
+pretrained_net, train_acc_history, test_acc_history, train_loss_history = train_fine_tuning(
+    pretrained_net, optimizer, batch_size=128, num_epochs=20
+)
+print("模型训练完成")
+
+# 第三部分：评估指标计算与可视化（使用之前提供的评估代码）
+from sklearn.metrics import accuracy_score, classification_report
+
+# 1. 模型预测
+def predict_model(model, data_loader, device, test_augs):
+    model.eval()
+    all_preds = []
+    all_probs = []
+    all_labels = []
+    with torch.no_grad():
+        for X, y in data_loader:
+            X, y = X.to(device), y.to(device)
+            X = test_augs(X)
+            outputs = model(X)
+            probs = torch.softmax(outputs, dim=1).cpu().numpy()
+            preds = np.argmax(probs, axis=1)
+            all_preds.extend(preds)
+            all_probs.extend(probs)
+            all_labels.extend(y.cpu().numpy())
+    return np.array(all_preds), np.array(all_probs), np.array(all_labels)
+
+# 2. 过滤有效样本
+def filter_valid_samples(preds, probs, labels):
+    valid_mask = labels != -1
+    return preds[valid_mask], probs[valid_mask], labels[valid_mask]
+
+# 3. 计算评估指标
+def calculate_evaluation_metrics(preds, probs, labels, num_classes):
+    accuracy = accuracy_score(labels, preds)
+    valid_classes = np.unique(labels)
+    precision = np.zeros(num_classes)
+    recall = np.zeros(num_classes)
+    f1 = np.zeros(num_classes)
+    roc_auc = np.zeros(num_classes)
+    
+    for cls in valid_classes:
+        y_true = (labels == cls).astype(int)
+        y_score = probs[:, cls]
+        y_pred = (preds == cls).astype(int)
+        if np.sum(y_true) == 0 or np.sum(y_true) == len(y_true):
+            continue
+        precision[cls] = precision_score(y_true, y_pred)
+        recall[cls] = recall_score(y_true, y_pred)
+        f1[cls] = f1_score(y_true, y_pred)
+        fpr, tpr, _ = roc_curve(y_true, y_score)
+        roc_auc[cls] = auc(fpr, tpr)
+    
+    macro_precision = np.mean(precision[valid_classes])
+    macro_recall = np.mean(recall[valid_classes])
+    macro_f1 = np.mean(f1[valid_classes])
+    micro_precision = precision_score(labels, preds, average='micro')
+    micro_recall = recall_score(labels, preds, average='micro')
+    micro_f1 = f1_score(labels, preds, average='micro')
+    
+    return {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'roc_auc': roc_auc,
+        'macro_precision': macro_precision,
+        'macro_recall': macro_recall,
+        'macro_f1': macro_f1,
+        'micro_precision': micro_precision,
+        'micro_recall': micro_recall,
+        'micro_f1': micro_f1,
+        'valid_classes': valid_classes
+    }
+
+# 4. 执行预测和评估
+test_loader = DataLoader(test_set, batch_size=128, shuffle=False)
+print("获取预测结果...")
+preds, probs, labels = predict_model(pretrained_net, test_loader, device, test_augs)
+valid_preds, valid_probs, valid_labels = filter_valid_samples(preds, probs, labels)
+print("计算评估指标...")
+metrics = calculate_evaluation_metrics(valid_preds, valid_probs, valid_labels, num_classes)
+
+# 打印评估结果
+print("\n===== 模型评估结果 =====")
+print(f"准确率: {metrics['accuracy']:.4f}")
+print(f"宏平均精确率: {metrics['macro_precision']:.4f}")
+print(f"宏平均召回率: {metrics['macro_recall']:.4f}")
+print(f"宏平均F1值: {metrics['macro_f1']:.4f}")
+
+# 获取测试集中的实际类别
+actual_classes = np.unique(valid_labels)
+print(f"测试集中实际包含的类别数: {len(actual_classes)}")
+
+# 提取实际类别的名称
+actual_class_names = [class_to_num[cls] for cls in actual_classes]
+
+# 打印详细分类报告（使用实际类别的名称）
+print("\n===== 详细分类报告 =====")
+print(classification_report(
+    valid_labels, 
+    valid_preds, 
+    labels=actual_classes,  # 显式指定标签
+    target_names=actual_class_names  # 仅使用实际存在的类别名称
+))
+
+# pretrained_net 是 torchvision.models.resnet34() 类
+path = 'net.pt'
+torch.save(pretrained_net.state_dict(), path)
